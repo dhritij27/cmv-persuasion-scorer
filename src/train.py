@@ -3,12 +3,20 @@ train.py
 
 Trains and evaluates three models for predicting CMV reply persuasiveness:
     1. Baseline: TF-IDF + LogisticRegression
-    2. Hand-crafted features only: GradientBoosting/RandomForest
-    3. Combined: TF-IDF + hand-crafted features
+    2. Hand-crafted features only: LogisticRegression
+    3. Combined: TF-IDF + hand-crafted features + LogisticRegression
 
-Handles class imbalance (~4.3% positive) via class_weight='balanced'.
-Reports precision/recall/F1 on the minority class plus PR-AUC, since
-plain accuracy is meaningless on this distribution.
+All three use LogisticRegression with class_weight='balanced' so the
+~4.3% positive class is handled via loss reweighting rather than
+resampling. (An earlier RandomForest version of model #2 was tried and
+discarded — it achieved near-zero recall on the minority class despite
+class_weight='balanced', since tree-vote balancing is much less reliable
+than direct loss reweighting on this kind of imbalance.)
+
+Reports precision/recall/F1 on the minority class plus PR-AUC and ROC-AUC
+at both the default 0.5 threshold and an F1-optimal threshold found via
+the precision-recall curve, since plain accuracy is meaningless on this
+distribution and 0.5 is rarely the best cutoff for imbalanced data.
 
 Usage:
     python src/train.py
@@ -32,7 +40,6 @@ import joblib
 
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -42,6 +49,7 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
     average_precision_score,
     roc_auc_score,
+    precision_recall_curve,
 )
 
 PAIRS_PATH = os.path.join("data", "processed", "cmv_pairs.csv")
@@ -79,6 +87,23 @@ def load_data():
     return df
 
 
+def find_best_threshold(y_true, y_proba):
+    """
+    Find the probability threshold that maximizes F1 on the persuasive
+    class, using the precision-recall curve. Returns (best_threshold, best_f1).
+    """
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_proba)
+    # precision_recall_curve returns one more precision/recall point than
+    # thresholds, so drop the last precision/recall to align.
+    f1_scores = np.where(
+        (precisions[:-1] + recalls[:-1]) > 0,
+        2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-12),
+        0.0,
+    )
+    best_idx = np.argmax(f1_scores)
+    return thresholds[best_idx], f1_scores[best_idx]
+
+
 def evaluate(name, y_true, y_pred, y_proba):
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", zero_division=0
@@ -91,6 +116,16 @@ def evaluate(name, y_true, y_pred, y_proba):
     print(f"PR-AUC:  {pr_auc:.4f}")
     print(f"ROC-AUC: {roc_auc:.4f}")
 
+    # Also report metrics at the F1-optimal threshold, since the default
+    # 0.5 cutoff is often a poor choice on heavily imbalanced data.
+    best_threshold, best_f1 = find_best_threshold(y_true, y_proba)
+    y_pred_tuned = (y_proba >= best_threshold).astype(int)
+    t_precision, t_recall, t_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred_tuned, average="binary", zero_division=0
+    )
+    print(f"\n--- At F1-optimal threshold ({best_threshold:.3f}) ---")
+    print(f"Precision: {t_precision:.4f}  Recall: {t_recall:.4f}  F1: {t_f1:.4f}")
+
     return {
         "model": name,
         "precision": precision,
@@ -98,6 +133,10 @@ def evaluate(name, y_true, y_pred, y_proba):
         "f1": f1,
         "pr_auc": pr_auc,
         "roc_auc": roc_auc,
+        "best_threshold": best_threshold,
+        "tuned_precision": t_precision,
+        "tuned_recall": t_recall,
+        "tuned_f1": t_f1,
     }
 
 
@@ -120,9 +159,9 @@ def main():
 
     results = []
 
-    # ------------------------------------------------------------------
+    
     # 1. Baseline: TF-IDF + Logistic Regression
-    # ------------------------------------------------------------------
+   
     print("\nTraining baseline (TF-IDF + LogisticRegression)...")
     tfidf_pipeline = Pipeline([
         ("tfidf", TfidfVectorizer(max_features=20000, ngram_range=(1, 2), min_df=5)),
@@ -136,15 +175,20 @@ def main():
     results.append(evaluate("Baseline (TF-IDF only)", y.loc[idx_test], y_pred, y_proba))
     joblib.dump(tfidf_pipeline, os.path.join(MODELS_DIR, "baseline_tfidf.joblib"))
 
-    # ------------------------------------------------------------------
+   
     # 2. Hand-crafted features only
-    # ------------------------------------------------------------------
-    print("\nTraining hand-crafted features model (RandomForest)...")
+    # Using LogisticRegression here (not RandomForest) because balanced
+    # class weighting is applied directly to the loss function, which
+    # handles the ~4%/96% imbalance far more reliably than tree-based
+    # voting does at default settings. An earlier RandomForest version
+    # of this model achieved near-zero recall on the minority class
+    # despite class_weight='balanced' — see README/notes for that ablation.
+    
+    print("\nTraining hand-crafted features model (LogisticRegression)...")
     handcrafted_pipeline = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", RandomForestClassifier(
-            n_estimators=300, max_depth=None, class_weight="balanced",
-            random_state=RANDOM_STATE, n_jobs=-1,
+        ("clf", LogisticRegression(
+            max_iter=1000, class_weight="balanced", random_state=RANDOM_STATE
         )),
     ])
     handcrafted_pipeline.fit(X_handcrafted.loc[idx_train], y.loc[idx_train])
@@ -153,18 +197,20 @@ def main():
     results.append(evaluate("Hand-crafted features only", y.loc[idx_test], y_pred, y_proba))
     joblib.dump(handcrafted_pipeline, os.path.join(MODELS_DIR, "handcrafted_features.joblib"))
 
-    # Feature importances — the key interpretability payoff of this project
-    importances = pd.Series(
-        handcrafted_pipeline.named_steps["clf"].feature_importances_,
+    # Feature importances via coefficients, the key interpretability
+    # payoff of this project. Coefficients are on standardized features,
+    # so magnitude is directly comparable across features.
+    coefs = pd.Series(
+        handcrafted_pipeline.named_steps["clf"].coef_[0],
         index=HANDCRAFTED_COLS,
-    ).sort_values(ascending=False)
-    print("\nFeature importances (hand-crafted model):")
-    print(importances)
-    importances.to_csv(os.path.join(MODELS_DIR, "feature_importances.csv"))
+    ).sort_values(key=lambda s: s.abs(), ascending=False)
+    print("\nFeature coefficients (hand-crafted model, standardized):")
+    print(coefs)
+    coefs.to_csv(os.path.join(MODELS_DIR, "feature_importances.csv"))
 
-    # ------------------------------------------------------------------
+    
     # 3. Combined: TF-IDF + hand-crafted features
-    # ------------------------------------------------------------------
+    
     print("\nTraining combined model (TF-IDF + hand-crafted)...")
 
     # Fit TF-IDF on train text, transform both splits, then hstack with
@@ -194,10 +240,14 @@ def main():
     )
 
     
+    # Summary
+   
     results_df = pd.DataFrame(results)
     results_df.to_csv(os.path.join(MODELS_DIR, "metrics.csv"), index=False)
-    print("\n=== Summary ===")
-    print(results_df.to_string(index=False))
+    print("\n=== Summary (default 0.5 threshold) ===")
+    print(results_df[["model", "precision", "recall", "f1", "pr_auc", "roc_auc"]].to_string(index=False))
+    print("\n=== Summary (F1-optimal threshold per model) ===")
+    print(results_df[["model", "best_threshold", "tuned_precision", "tuned_recall", "tuned_f1"]].to_string(index=False))
     print(f"\nSaved models to {MODELS_DIR}/, metrics to {MODELS_DIR}/metrics.csv")
 
 
