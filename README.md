@@ -58,6 +58,8 @@ Lexicon features are matched on word boundaries and normalized per 100 words, so
 | TF-IDF only (LR) | 0.100 [0.089, 0.114] | 0.800 | 0.18 | 0.17 |
 | Sentiment only (LR) | 0.058 [0.051, 0.068] | 0.694 | 0.10 | 0.11 |
 
+Full tables, including precision/recall at the tuned threshold, are in [`reports/results/`](reports/results/).
+
 Chance PR-AUC is 0.025. Among the 1% of comments the best model is most confident about, 26% earned a delta, about 10× the base rate.
 
 ![Precision-recall curves](reports/figures/pr_curves.png)
@@ -84,7 +86,7 @@ Chance PR-AUC is 0.025. Among the 1% of comments the best model is most confiden
 
 **3. Being in a dialogue with the OP matters most.** Removing the context group drops PR-AUC from 0.169 to 0.104, the only ablation well outside the noise (individual text groups move it by ±0.004 because they overlap heavily). The main driver is whether a comment replies to the OP directly: deltas go to people engaging the OP, not to side arguments with other commenters. This is a property of the conversation, not the prose.
 
-**4. Among text features, effort and engagement with the OP's words stand out.** Standardized coefficients from the hand-crafted LR (`models/feature_coefficients.csv`) show:
+**4. Among text features, effort and engagement with the OP's words stand out.** Standardized coefficients from the hand-crafted LR ([`reports/results/feature_coefficients.csv`](reports/results/feature_coefficients.csv)) show:
 - Length is by far the largest (+1.46 for log word count). Longer, more developed replies win.
 - Reusing the OP's *content* words helps (+0.31), while introducing lots of novel vocabulary hurts (−0.17). Persuasive replies argue on the OP's terms.
 - Certainty markers hurt (−0.18), and hedges help slightly (+0.07). Sounding sure of yourself doesn't change minds.
@@ -134,8 +136,10 @@ The score comes from a class-balanced model, so treat it as a ranking signal rat
 ```
 cmv-persuasion-scorer/
 ├── data/                 # processed data (gitignored)
-├── models/               # model artifacts, metrics CSVs (gitignored)
-├── reports/figures/      # PR curves, ablation chart
+├── models/               # trained model artifacts (gitignored)
+├── reports/
+│   ├── figures/          # PR curves, ablation chart
+│   └── results/          # metrics, ablation, and coefficient tables (CSV)
 ├── src/
 │   ├── data_loader.py    # corpus → challenger comments with DeltaBot-derived labels
 │   ├── features.py       # grouped feature extraction (parallel)

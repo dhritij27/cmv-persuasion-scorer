@@ -36,10 +36,11 @@ Usage:
 
 Outputs:
     models/scorer.joblib                deployable TF-IDF + hand-crafted model (predict.py)
-    models/metrics_comment_level.csv    Task A metrics with CIs
-    models/metrics_paired.csv           Task B metrics
-    models/ablation.csv                 feature-group ablation
-    models/feature_coefficients.csv     standardized LR coefficients (hand-crafted)
+    models/test_predictions_comment_level.parquet   test-set scores (for --figures-only)
+    reports/results/metrics_comment_level.csv       Task A metrics with CIs
+    reports/results/metrics_paired.csv              Task B metrics
+    reports/results/ablation.csv                    feature-group ablation
+    reports/results/feature_coefficients.csv        standardized LR coefficients (hand-crafted)
     reports/figures/*.png               PR curves and ablation chart
 """
 
@@ -70,6 +71,7 @@ from features import ALL_FEATURE_COLS, FEATURE_GROUPS, TEXT_FEATURE_COLS  # noqa
 PROCESSED_DIR = os.path.join("data", "processed")
 MODELS_DIR = "models"
 FIGURES_DIR = os.path.join("reports", "figures")
+RESULTS_DIR = os.path.join("reports", "results")  # committed: small metric tables
 RANDOM_STATE = 42
 
 TFIDF_PARAMS = dict(max_features=50000, ngram_range=(1, 2), min_df=5, sublinear_tf=True)
@@ -426,7 +428,7 @@ def main():
     args = parser.parse_args()
 
     preds_path = os.path.join(MODELS_DIR, "test_predictions_comment_level.parquet")
-    ablation_path = os.path.join(MODELS_DIR, "ablation.csv")
+    ablation_path = os.path.join(RESULTS_DIR, "ablation.csv")
     if args.figures_only:
         preds = pd.read_parquet(preds_path)
         ablation = pd.read_csv(ablation_path) if os.path.exists(ablation_path) else None
@@ -435,19 +437,20 @@ def main():
         return
 
     os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     pd.set_option("display.width", 200)
     df = load_data()
     print(f"Loaded {len(df)} challenger comments.")
 
     results, test, test_preds, scorer = run_comment_level(df, args.folds, args.bootstrap)
-    results.to_csv(os.path.join(MODELS_DIR, "metrics_comment_level.csv"), index=False)
+    results.to_csv(os.path.join(RESULTS_DIR, "metrics_comment_level.csv"), index=False)
     joblib.dump(scorer, os.path.join(MODELS_DIR, "scorer.joblib"))
     pd.DataFrame({"delta_awarded": test["delta_awarded"].values, **test_preds}).to_parquet(preds_path, index=False)
     print("\n=== Task A: comment-level (test threads) ===")
     print(results.round(4).to_string(index=False))
 
     coefs = lr_coefficients(df)
-    coefs.to_csv(os.path.join(MODELS_DIR, "feature_coefficients.csv"), index=False)
+    coefs.to_csv(os.path.join(RESULTS_DIR, "feature_coefficients.csv"), index=False)
     print("\n=== Standardized coefficients, hand-crafted text LR ===")
     print(coefs.round(3).to_string(index=False))
 
@@ -460,12 +463,12 @@ def main():
         ablation = pd.read_csv(ablation_path)
 
     paired = run_paired(df, args.bootstrap)
-    paired.to_csv(os.path.join(MODELS_DIR, "metrics_paired.csv"), index=False)
+    paired.to_csv(os.path.join(RESULTS_DIR, "metrics_paired.csv"), index=False)
     print("\n=== Task B: paired root replies (test pairs) ===")
     print(paired.round(4).to_string(index=False))
 
     save_figures(test, test_preds, ablation)
-    print(f"\nSaved models and metrics to {MODELS_DIR}/, figures to {FIGURES_DIR}/")
+    print(f"\nSaved models to {MODELS_DIR}/, results to {RESULTS_DIR}/, figures to {FIGURES_DIR}/")
 
 
 if __name__ == "__main__":
