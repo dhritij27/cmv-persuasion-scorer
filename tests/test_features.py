@@ -7,28 +7,40 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from argument_transfer import (  # noqa: E402
+    ROLES,
+    TRANSFER_FEATURE_COLS,
+    fit_effectiveness_model,
+    fit_role_model,
+    split_chunks,
+    transfer_features,
+)
 from data_loader import clean_text  # noqa: E402
 from features import (  # noqa: E402
     ALL_FEATURE_COLS,
     FEATURE_GROUPS,
+    HANDCRAFTED_TEXT_COLS,
     TEXT_FEATURE_COLS,
     context_features,
     extract_text_features,
 )
+from evaluate_external import pairwise  # noqa: E402
 from train import best_f1_threshold, pairwise_accuracy  # noqa: E402
 
 OP = "CMV: Public transit should be free. Fares are a regressive tax on the poor."
 
 
-def test_returns_every_text_feature():
+def test_returns_every_handcrafted_text_feature():
     feats = extract_text_features(OP, "I think fares matter.")
-    assert set(feats) == set(TEXT_FEATURE_COLS)
+    assert set(feats) == set(HANDCRAFTED_TEXT_COLS)
     assert all(np.isfinite(v) for v in feats.values())
 
 
 def test_feature_groups_are_disjoint_and_complete():
     cols = [c for group in FEATURE_GROUPS.values() for c in group]
     assert len(cols) == len(set(cols)) == len(ALL_FEATURE_COLS)
+    assert set(TEXT_FEATURE_COLS) == set(HANDCRAFTED_TEXT_COLS) | set(TRANSFER_FEATURE_COLS)
+    assert not set(FEATURE_GROUPS["context"]) & set(TEXT_FEATURE_COLS)
 
 
 def test_lexicons_match_whole_words_only():
@@ -101,3 +113,50 @@ def test_pairwise_accuracy():
     })
     acc, n, _ = pairwise_accuracy(df, "score")
     assert n == 2 and acc == pytest.approx(0.5)
+
+
+# --- Argument transfer (PERSUADE) -------------------------------------------
+
+def test_split_chunks_drops_quotes_and_splits_long_paragraphs():
+    text = "> quoted line\n\nFirst paragraph.\n\n" + " ".join(["Sentence number %d." % i for i in range(60)])
+    chunks = split_chunks(text)
+    assert chunks[0] == "First paragraph."
+    assert all(not c.startswith(">") for c in chunks)
+    assert len(chunks) >= 3  # the 180-word paragraph is split into pieces
+    assert split_chunks("") == []
+
+
+@pytest.fixture(scope="module")
+def tiny_models():
+    """Tiny PERSUADE-style models fit on synthetic segments, one or more per role."""
+    rows = []
+    for role in ROLES:
+        for i in range(4):
+            rows.append((f"{role.lower()} text about topic {i} and {role.lower()} words", role, float(i % 2)))
+    texts, roles, eff = zip(*rows)
+    return {
+        "role": fit_role_model(list(texts), np.array(roles)),
+        "effectiveness": fit_effectiveness_model(list(texts), np.array(roles), np.array(eff)),
+    }
+
+
+def test_transfer_features_shape_and_ranges(tiny_models):
+    texts = ["claim text about topic 1.\n\nevidence text about topic 2.", "", "rebuttal words"]
+    out = transfer_features(texts, models=tiny_models)
+    assert list(out.columns) == TRANSFER_FEATURE_COLS and len(out) == 3
+    assert np.isfinite(out.values).all()
+    share_cols = [c for c in TRANSFER_FEATURE_COLS if c.startswith("arg_share_")]
+    # shares cover claim/evidence/counterclaim/rebuttal/position/other (not lead/conclusion),
+    # so they sum to at most 1 for non-empty texts and exactly 0 for empty ones
+    assert out.loc[0, share_cols].sum() <= 1.0 + 1e-9
+    assert (out.loc[1] == 0).all()
+    assert 0.0 <= out.loc[0, "arg_effectiveness_mean"] <= out.loc[0, "arg_effectiveness_max"] <= 1.0
+    assert out.loc[0, "arg_n_chunks"] == pytest.approx(np.log1p(2))
+
+
+def test_external_pairwise_counts_ties_as_half():
+    pred = np.array([1, 0, 1, 0])
+    truth = np.array([1, 1, 0, 0])
+    ties = np.array([False, False, False, True])
+    correct = pairwise(pred, truth, ties)
+    assert list(correct) == [1.0, 0.0, 0.0, 0.5]

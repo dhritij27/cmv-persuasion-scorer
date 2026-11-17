@@ -10,3 +10,5 @@ vaderSentiment
 matplotlib
 pytest
 jupyter
+kagglehub
+datasets
