@@ -15,6 +15,10 @@ Groups
 - formatting:    lists, emphasis, numbers
 - sentiment:     VADER sentiment (tests whether *tone* predicts persuasion)
 - interplay:     vocabulary overlap with the OP (Tan et al. 2016 "interplay" features)
+- argument_structure:
+                 predicted discourse roles (claim / evidence / rebuttal ...) and
+                 expert-style effectiveness ratings of each chunk, transferred from
+                 models trained on the PERSUADE essay corpus (argument_transfer.py)
 - context:       position in the discussion (depth, timing, entry order) -- not
                  derived from the text, so excluded from the deployable scorer
 
@@ -33,6 +37,7 @@ Output:
 
 import os
 import re
+import sys
 from functools import lru_cache
 from multiprocessing import Pool
 
@@ -41,6 +46,9 @@ import pandas as pd
 import textstat
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from argument_transfer import TRANSFER_FEATURE_COLS, transfer_features  # noqa: E402
 
 PROCESSED_DIR = os.path.join("data", "processed")
 COMMENTS_PATH = os.path.join(PROCESSED_DIR, "comments.parquet")
@@ -94,9 +102,17 @@ FEATURE_GROUPS = {
         "op_jaccard_all", "op_jaccard_content", "op_jaccard_stop",
         "op_content_coverage", "reply_content_novelty",
     ],
+    # Transferred from models trained on the PERSUADE essay corpus (see
+    # argument_transfer.py): predicted discourse roles and expert-style
+    # effectiveness ratings of each paragraph-sized chunk.
+    "argument_structure": list(TRANSFER_FEATURE_COLS),
     "context": ["depth", "is_root_reply", "replies_to_op", "log_minutes_since_op", "log_root_rank"],
 }
-TEXT_FEATURE_COLS = [c for g, cols in FEATURE_GROUPS.items() if g != "context" for c in cols]
+NON_HANDCRAFTED_GROUPS = {"argument_structure", "context"}
+# Computed per comment by extract_text_features()
+HANDCRAFTED_TEXT_COLS = [c for g, cols in FEATURE_GROUPS.items() if g not in NON_HANDCRAFTED_GROUPS for c in cols]
+# Everything derivable from the text alone (what the deployable scorer may use)
+TEXT_FEATURE_COLS = HANDCRAFTED_TEXT_COLS + FEATURE_GROUPS["argument_structure"]
 ALL_FEATURE_COLS = [c for cols in FEATURE_GROUPS.values() for c in cols]
 
 # --- Helpers ----------------------------------------------------------------
@@ -257,7 +273,12 @@ def main():
         context_features(r.depth, r.is_root_reply, r.replies_to_op, r.minutes_since_op, r.root_rank)
         for r in comments.itertuples(index=False)
     ])
-    out = pd.concat([comments[["comment_id"]], text_df, ctx_df], axis=1)[["comment_id"] + ALL_FEATURE_COLS]
+
+    print("Computing argument-structure features with the PERSUADE models...")
+    transfer_df = transfer_features(comments["reply_text"].tolist())
+
+    out = pd.concat([comments[["comment_id"]], text_df, transfer_df, ctx_df], axis=1)
+    out = out[["comment_id"] + ALL_FEATURE_COLS]
     out.to_parquet(OUTPUT_PATH, index=False)
     print(f"Saved {OUTPUT_PATH}")
     print(out[ALL_FEATURE_COLS].describe().T[["mean", "std", "min", "max"]].round(3))

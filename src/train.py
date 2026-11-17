@@ -10,8 +10,10 @@ Task A -- comment-level delta prediction
         - Sentiment only (LR)                  tests whether tone alone predicts persuasion
         - Hand-crafted text features (LR)      interpretable baseline
         - Hand-crafted text features (HGB)     same features, non-linear model
+        - Hand-crafted + argument transfer     adds PERSUADE-derived argument-structure
+          (LR)                                 features (see argument_transfer.py)
         - TF-IDF (LR)                          word choice
-        - TF-IDF + hand-crafted text (LR)      the deployable scorer used by predict.py
+        - TF-IDF + text features (LR)          the deployable scorer used by predict.py
         - All features incl. context (HGB)     adds where/when the comment was posted
         - Stacked (HGB + out-of-fold TF-IDF)   gradient boosting over all features plus
                                                the TF-IDF model's out-of-fold score
@@ -66,7 +68,9 @@ from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from features import ALL_FEATURE_COLS, FEATURE_GROUPS, TEXT_FEATURE_COLS  # noqa: E402
+from features import (  # noqa: E402
+    ALL_FEATURE_COLS, FEATURE_GROUPS, HANDCRAFTED_TEXT_COLS, TEXT_FEATURE_COLS,
+)
 
 PROCESSED_DIR = os.path.join("data", "processed")
 MODELS_DIR = "models"
@@ -79,6 +83,7 @@ TFIDF_PARAMS = dict(max_features=50000, ngram_range=(1, 2), min_df=5, sublinear_
 # (grouped validation PR-AUC 0.091 at C=1 vs 0.106 at C=0.1 for the combined model).
 TFIDF_C = 0.1
 SENTIMENT_COLS = FEATURE_GROUPS["sentiment"]
+ARG_COLS = FEATURE_GROUPS["argument_structure"]
 
 
 # --- Data ---------------------------------------------------------------------
@@ -128,8 +133,10 @@ def fit_predict_text_models(tr: pd.DataFrame, ap: pd.DataFrame, label: str):
     preds["Sentiment only (LR)"], _ = fit_predict_lr_dense(
         tr[SENTIMENT_COLS].values, y_tr, ap[SENTIMENT_COLS].values)
     preds["Hand-crafted text (LR)"], _ = fit_predict_lr_dense(
-        tr[TEXT_FEATURE_COLS].values, y_tr, ap[TEXT_FEATURE_COLS].values)
+        tr[HANDCRAFTED_TEXT_COLS].values, y_tr, ap[HANDCRAFTED_TEXT_COLS].values)
     preds["Hand-crafted text (HGB)"], _ = fit_predict_hgb(
+        tr[HANDCRAFTED_TEXT_COLS].values, y_tr, ap[HANDCRAFTED_TEXT_COLS].values)
+    preds["Hand-crafted + argument transfer (LR)"], _ = fit_predict_lr_dense(
         tr[TEXT_FEATURE_COLS].values, y_tr, ap[TEXT_FEATURE_COLS].values)
     preds["All features + context (HGB)"], _ = fit_predict_hgb(
         tr[ALL_FEATURE_COLS].values, y_tr, ap[ALL_FEATURE_COLS].values)
@@ -145,7 +152,7 @@ def fit_predict_text_models(tr: pd.DataFrame, ap: pd.DataFrame, label: str):
     C_tr = sparse.hstack([T_tr, scaler.transform(tr[TEXT_FEATURE_COLS].values)]).tocsr()
     C_ap = sparse.hstack([T_ap, scaler.transform(ap[TEXT_FEATURE_COLS].values)]).tocsr()
     combined_clf = make_lr(TFIDF_C).fit(C_tr, y_tr)
-    preds["TF-IDF + hand-crafted text (LR)"] = combined_clf.predict_proba(C_ap)[:, 1]
+    preds["TF-IDF + text features (LR)"] = combined_clf.predict_proba(C_ap)[:, 1]
 
     fitted = {"tfidf": tfidf, "scaler": scaler, "clf": combined_clf}
     return preds, fitted
@@ -258,7 +265,7 @@ def run_comment_level(df, n_folds, n_boot):
                                 test["conversation_id"].values, n_boot))
     results = pd.DataFrame(results).sort_values("pr_auc", ascending=False)
 
-    deploy_name = "TF-IDF + hand-crafted text (LR)"
+    deploy_name = "TF-IDF + text features (LR)"
     scorer = {
         **scorer_parts,
         "feature_cols": TEXT_FEATURE_COLS,
@@ -309,6 +316,10 @@ def run_paired(df, n_boot):
         "Sentiment only (LR)": lambda: fit_predict_lr_dense(
             train[SENTIMENT_COLS].values, y_tr, test[SENTIMENT_COLS].values)[0],
         "Hand-crafted text (LR)": lambda: fit_predict_lr_dense(
+            train[HANDCRAFTED_TEXT_COLS].values, y_tr, test[HANDCRAFTED_TEXT_COLS].values)[0],
+        "Argument transfer only (LR)": lambda: fit_predict_lr_dense(
+            train[ARG_COLS].values, y_tr, test[ARG_COLS].values)[0],
+        "Hand-crafted + argument transfer (LR)": lambda: fit_predict_lr_dense(
             train[TEXT_FEATURE_COLS].values, y_tr, test[TEXT_FEATURE_COLS].values)[0],
         "Interplay only (LR)": lambda: fit_predict_lr_dense(
             train[FEATURE_GROUPS["interplay"]].values, y_tr, test[FEATURE_GROUPS["interplay"]].values)[0],
@@ -326,7 +337,7 @@ def run_paired(df, n_boot):
         clf = LogisticRegression(max_iter=2000, C=0.3, random_state=RANDOM_STATE).fit(X_tr, y_tr)
         return clf.predict_proba(X_te)[:, 1]
 
-    models["TF-IDF + hand-crafted text (LR)"] = tfidf_combined
+    models["TF-IDF + text features (LR)"] = tfidf_combined
 
     rng = np.random.default_rng(RANDOM_STATE)
     rows = []
@@ -343,7 +354,7 @@ def run_paired(df, n_boot):
 
 
 def lr_coefficients(df):
-    """Standardized LR coefficients on the hand-crafted text features (Task A, full train)."""
+    """Standardized LR coefficients on all text features (Task A, full train)."""
     train = df[df["split"] == "train"]
     _, (scaler, clf) = fit_predict_lr_dense(
         train[TEXT_FEATURE_COLS].values, train["delta_awarded"].values, train[TEXT_FEATURE_COLS].values[:1])
@@ -378,7 +389,7 @@ def save_figures(test, test_preds, ablation):
     os.makedirs(FIGURES_DIR, exist_ok=True)
     y = test["delta_awarded"].values
 
-    shown = ["Stacked (HGB + OOF TF-IDF score)", "TF-IDF + hand-crafted text (LR)",
+    shown = ["Stacked (HGB + OOF TF-IDF score)", "TF-IDF + text features (LR)",
              "Hand-crafted text (HGB)", "Sentiment only (LR)"]
     fig, ax = plt.subplots(figsize=(7, 4.5), facecolor=SURFACE)
     _style(ax)

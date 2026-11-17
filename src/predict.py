@@ -26,6 +26,7 @@ import numpy as np
 from scipy import sparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from argument_transfer import transfer_features  # noqa: E402
 from data_loader import clean_text  # noqa: E402
 from features import extract_text_features  # noqa: E402
 
@@ -42,6 +43,8 @@ def score(scorer, op_text: str, reply_text: str, top: int = 8) -> dict:
     op_text, reply_text = clean_text(op_text), clean_text(reply_text)
     cols = scorer["feature_cols"]
     feats = extract_text_features(op_text, reply_text)
+    # Argument-structure features come from the PERSUADE-trained models.
+    feats.update(transfer_features([reply_text]).iloc[0].to_dict())
     x_hand = scorer["scaler"].transform(np.array([[feats[c] for c in cols]]))
     x_tfidf = scorer["tfidf"].transform([reply_text])
     x = sparse.hstack([x_tfidf, x_hand]).tocsr()
